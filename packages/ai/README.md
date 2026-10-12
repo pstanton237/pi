@@ -510,8 +510,6 @@ Tools enable LLMs to interact with external systems. This library uses TypeBox s
 
 ### Defining Tools
 
-Tool names are case-sensitive. Anthropic OAuth uses Claude Code's canonical casing where possible and assigns distinct wire names when names collide, so tools such as `task` and `Task` remain separate. Tool-call events and saved messages retain the original registered names; Anthropic API-key requests do not rename tools.
-
 ```typescript
 import { Type, type Tool, StringEnum } from '@earendil-works/pi-ai';
 
