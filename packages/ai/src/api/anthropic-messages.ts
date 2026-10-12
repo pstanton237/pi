@@ -120,16 +120,40 @@ const claudeCodeTools = [
 
 const ccToolLookup = new Map(claudeCodeTools.map((t) => [t.toLowerCase(), t]));
 
-// Convert tool name to CC canonical casing if it matches (case-insensitive)
-const toClaudeCodeName = (name: string) => ccToolLookup.get(name.toLowerCase()) ?? name;
-const fromClaudeCodeName = (name: string, tools?: Tool[]) => {
-	if (tools && tools.length > 0) {
-		const lowerName = name.toLowerCase();
-		const matchedTool = tools.find((tool) => tool.name.toLowerCase() === lowerName);
-		if (matchedTool) return matchedTool.name;
+interface OAuthToolNames {
+	toWire(name: string): string;
+	fromWire(name: string): string;
+}
+
+function createOAuthToolNames(messages: Message[]): OAuthToolNames {
+	const wireNames = new Map<string, string>();
+	const originalNames = new Map<string, string>();
+	let aliasIndex = 0;
+	const toWire = (name: string): string => {
+		const existing = wireNames.get(name);
+		if (existing !== undefined) return existing;
+		let wireName = ccToolLookup.get(name.toLowerCase()) ?? name;
+		while (originalNames.has(wireName) || wireName === DEFERRED_TOOL_PLACEHOLDER.name) {
+			wireName = `pi_tool_${++aliasIndex}`;
+		}
+		wireNames.set(name, wireName);
+		originalNames.set(wireName, name);
+		return wireName;
+	};
+
+	// Replay before collapsing system messages; never reassign a cached or historical name.
+	for (const message of messages) {
+		if (message.role === "system") {
+			for (const tool of message.toolsRemoved ?? []) toWire(tool.name);
+			for (const tool of message.toolsAdded ?? []) toWire(tool.name);
+		} else if (message.role === "assistant") {
+			for (const block of message.content ?? []) {
+				if (block.type === "toolCall") toWire(block.name);
+			}
+		}
 	}
-	return name;
-};
+	return { toWire, fromWire: (name) => originalNames.get(name) ?? name };
+}
 
 /**
  * Convert content blocks to Anthropic API format
@@ -575,7 +599,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 ): AssistantMessageEventStream => {
 	const stream = new AssistantMessageEventStream();
 	const normalizedContext = resolveTranscript(context, getAnthropicCompat(model).supportsMidConvoSystemMessages);
-	const currentTools = getCurrentTools(normalizedContext.messages);
 
 	(async () => {
 		const providerThinkingLevel = model.compat?.supportsMidConvoEffort ? (options?.effort ?? "high") : undefined;
@@ -636,7 +659,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				client = created.client;
 				isOAuth = created.isOAuthToken;
 			}
-			let params = buildParams(model, normalizedContext, isOAuth, options);
+			const toolNames = isOAuth ? createOAuthToolNames(context.messages) : undefined;
+			let params = buildParams(model, normalizedContext, isOAuth, toolNames, options);
 			const nextParams = await options?.onPayload?.(params, model);
 			if (nextParams !== undefined) {
 				params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
@@ -724,9 +748,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 						const block: Block = {
 							type: "toolCall",
 							id: event.content_block.id,
-							name: isOAuth
-								? fromClaudeCodeName(event.content_block.name, currentTools)
-								: event.content_block.name,
+							name: toolNames?.fromWire(event.content_block.name) ?? event.content_block.name,
 							arguments: (event.content_block.input as Record<string, any>) ?? {},
 							partialJson: "",
 							index: event.index,
@@ -1125,6 +1147,7 @@ function buildParams(
 	model: Model<"anthropic-messages">,
 	context: TranscriptContext,
 	isOAuthToken: boolean,
+	toolNames: OAuthToolNames | undefined,
 	options?: AnthropicOptions,
 ): MessageCreateParamsStreaming {
 	const { cacheControl } = getCacheControl(model, options?.cacheRetention, options?.env);
@@ -1142,13 +1165,12 @@ function buildParams(
 		compat.supportsMidConvoSystemMessages && compat.supportsMidConvoToolChanges && initialTools.length > 0;
 	const converted = convertMessages(
 		conversationMessages,
-		isOAuthToken,
+		toolNames,
 		cacheControl,
 		compat.allowEmptySignature,
 		model.compat?.supportsMidConvoEffort === true ? model.provider : undefined,
 		nativeToolChanges
-			? (tools) =>
-					convertTools(tools, isOAuthToken, compat.supportsEagerToolInputStreaming, compat.supportsStrictTools)
+			? (tools) => convertTools(tools, toolNames, compat.supportsEagerToolInputStreaming, compat.supportsStrictTools)
 			: undefined,
 	);
 	const activeEffort = options?.effort ?? "high";
@@ -1210,7 +1232,7 @@ function buildParams(
 		params.tools = [
 			...convertTools(
 				initialTools,
-				isOAuthToken,
+				toolNames,
 				compat.supportsEagerToolInputStreaming,
 				compat.supportsStrictTools,
 				toolCacheControl,
@@ -1222,7 +1244,7 @@ function buildParams(
 		if (tools.length > 0) {
 			params.tools = convertTools(
 				tools,
-				isOAuthToken,
+				toolNames,
 				compat.supportsEagerToolInputStreaming,
 				compat.supportsStrictTools,
 				toolCacheControl,
@@ -1274,7 +1296,10 @@ function buildParams(
 		if (typeof options.toolChoice === "string") {
 			params.tool_choice = { type: options.toolChoice };
 		} else {
-			params.tool_choice = options.toolChoice;
+			params.tool_choice = {
+				...options.toolChoice,
+				name: toolNames?.toWire(options.toolChoice.name) ?? options.toolChoice.name,
+			};
 		}
 	}
 
@@ -1307,7 +1332,7 @@ interface ConvertedAnthropicMessages {
 
 function convertMessages(
 	transformedMessages: Message[],
-	isOAuthToken: boolean,
+	toolNames: OAuthToolNames | undefined,
 	cacheControl?: CacheControlEphemeral,
 	allowEmptySignature = false,
 	managedProvider?: string,
@@ -1344,7 +1369,7 @@ function convertMessages(
 					if (redefined.has(tool.name)) continue;
 					blocks.push({
 						type: "tool_removal",
-						tool: { type: "tool_reference", name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name },
+						tool: { type: "tool_reference", name: toolNames?.toWire(tool.name) ?? tool.name },
 					});
 				}
 				for (const definition of convertToolDefinitions(added)) {
@@ -1440,7 +1465,7 @@ function convertMessages(
 					blocks.push({
 						type: "tool_use",
 						id: block.id,
-						name: isOAuthToken ? toClaudeCodeName(block.name) : block.name,
+						name: toolNames?.toWire(block.name) ?? block.name,
 						input: block.arguments ?? {},
 					});
 				}
@@ -1575,7 +1600,7 @@ const isAnthropicStrictUnsupportedKeyword: UnsupportedStrictSchemaKeywordCheck =
 
 function convertTools(
 	tools: Tool[],
-	isOAuthToken: boolean,
+	toolNames: OAuthToolNames | undefined,
 	supportsEagerToolInputStreaming: boolean,
 	supportsStrictTools: boolean,
 	cacheControl?: CacheControlEphemeral,
@@ -1600,7 +1625,7 @@ function convertTools(
 				: legacyInputSchema;
 
 		return {
-			name: isOAuthToken ? toClaudeCodeName(tool.name) : tool.name,
+			name: toolNames?.toWire(tool.name) ?? tool.name,
 			description: tool.description,
 			...(supportsEagerToolInputStreaming ? { eager_input_streaming: true } : {}),
 			...(strict === true ? { strict: true } : {}),
